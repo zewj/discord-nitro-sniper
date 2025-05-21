@@ -41,6 +41,56 @@ Run the sniper:
 go run main.go
 ```
 
+## Running on a VPS
+
+To run the Discord Nitro Sniper on a VPS, follow these steps:
+
+1. **Set Up Your VPS**:
+   - Choose a VPS provider (e.g., DigitalOcean, AWS, Linode) and create a new instance.
+   - Ensure your VPS has a Linux-based OS (e.g., Ubuntu).
+
+2. **Install Go**:
+   - SSH into your VPS and install Go 1.21 or higher:
+     ```bash
+     wget https://golang.org/dl/go1.21.0.linux-amd64.tar.gz
+     sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+     export PATH=$PATH:/usr/local/go/bin
+     ```
+
+3. **Clone the Repository**:
+   - Clone the repository to your VPS:
+     ```bash
+     git clone https://github.com/zewj/discord-nitro-sniper.git
+     cd discord-nitro-sniper
+     ```
+
+4. **Configure Environment**:
+   - Create a `.env` file with your main token:
+     ```
+     MAIN_TOKEN=your_main_token_here
+     ```
+   - Create a `tokens.txt` file with your additional tokens and webhook URL:
+     ```
+     WEBHOOK_URL=your_webhook_url_here
+     token1_here
+     token2_here
+     token3_here
+     ```
+
+5. **Run the Sniper**:
+   - Execute the sniper:
+     ```bash
+     go run main.go
+     ```
+
+6. **Keep the Sniper Running**:
+   - Use a process manager like `screen` or `tmux` to keep the sniper running in the background:
+     ```bash
+     screen -S nitro-sniper
+     go run main.go
+     ```
+   - Detach from the screen session with `Ctrl+A+D` and reattach with `screen -r nitro-sniper`.
+
 ## Security
 
 - Never share your tokens or webhook URLs
