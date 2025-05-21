@@ -51,6 +51,13 @@ type TokenStatus struct {
 	ReconnectAttempts int
 }
 
+type NitroCodeEvent struct {
+	Code      string
+	ChannelID string // for future use if needed
+	AuthorID  string // for future use if needed
+	Source    int    // index of the token that found it
+}
+
 var lastConnectionWebhook time.Time
 
 func loadMainToken() string {
@@ -205,7 +212,7 @@ func sendConnectionWebhook(webhookURL string, statuses []TokenStatus) {
 	lastConnectionWebhook = time.Now()
 }
 
-func connectWebSocket(token string, index int, statuses []TokenStatus, webhook string) *websocket.Conn {
+func connectWebSocket(token string, index int, statuses []TokenStatus) *websocket.Conn {
 	maxRetries := 5
 	baseDelay := time.Second
 
@@ -251,7 +258,7 @@ func connectWebSocket(token string, index int, statuses []TokenStatus, webhook s
 	return nil
 }
 
-func handleWebSocketConnection(conn *websocket.Conn, token string, index int, statuses []TokenStatus, webhook string) {
+func handleWebSocketConnection(conn *websocket.Conn, token string, index int, statuses []TokenStatus, webhook string, codeChan chan<- NitroCodeEvent) {
 	defer conn.Close()
 
 	for {
@@ -264,7 +271,7 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 			// Check if we should attempt reconnection
 			if statuses[index].ReconnectAttempts <= 5 {
 				log.Printf("Token %d WebSocket error: %v. Attempting reconnection...", index+1, err)
-				newConn := connectWebSocket(token, index, statuses, webhook)
+				newConn := connectWebSocket(token, index, statuses)
 				if newConn != nil {
 					conn = newConn
 					continue
@@ -304,43 +311,10 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 			json.Unmarshal(event.D, &msgCreate)
 			code := extractNitroCode(msgCreate.Content)
 			if code != "" {
-				startTime := time.Now()
-				log.Printf("Found Nitro gift: %s", code)
-				var claimWg sync.WaitGroup
-				results := make(chan map[string]interface{}, 1)
-
-				claimWg.Add(1)
-				go claimNitro(token, code, index+1, index == 0, &claimWg, results)
-
-				go func() {
-					claimWg.Wait()
-					close(results)
-				}()
-
-				var successful []string
-				var failMsg string
-				for res := range results {
-					if res["success"].(bool) {
-						successful = append(successful, fmt.Sprintf("Token %d", index+1))
-						log.Printf("Token %d successfully claimed Nitro!", index+1)
-					} else {
-						log.Printf("Token %d failed to claim: %s", index+1, res["message"].(string))
-						failMsg = res["message"].(string)
-					}
-				}
-				snipeTime := time.Since(startTime)
-				if len(successful) > 0 {
-					msg := fmt.Sprintf("🎉 Successfully claimed Nitro gift!\nCode: `%s`\nClaimed with: %s\n⏱️ Snipe time: %s",
-						code,
-						strings.Join(successful, ", "),
-						snipeTime.Round(time.Millisecond))
-					sendWebhook(webhook, msg)
-				} else {
-					msg := fmt.Sprintf("❌ Failed to claim Nitro gift\nCode: `%s`\nReason: %s\n⏱️ Attempt time: %s",
-						code,
-						failMsg,
-						snipeTime.Round(time.Millisecond))
-					sendWebhook(webhook, msg)
+				log.Printf("Token %d spotted Nitro gift: %s", index+1, code)
+				codeChan <- NitroCodeEvent{
+					Code:   code,
+					Source: index,
 				}
 			}
 		}
@@ -372,6 +346,9 @@ func main() {
 		}
 	}
 
+	// Channel for Nitro codes
+	codeChan := make(chan NitroCodeEvent, 10)
+
 	// Create a WaitGroup to wait for all connections
 	var wg sync.WaitGroup
 
@@ -380,12 +357,53 @@ func main() {
 		wg.Add(1)
 		go func(index int, token string) {
 			defer wg.Done()
-			conn := connectWebSocket(token, index, statuses, webhook)
+			conn := connectWebSocket(token, index, statuses)
 			if conn != nil {
-				handleWebSocketConnection(conn, token, index, statuses, webhook)
+				handleWebSocketConnection(conn, token, index, statuses, webhook, codeChan)
 			}
 		}(i, token)
 	}
+
+	// Main token sniping goroutine
+	go func() {
+		for event := range codeChan {
+			startTime := time.Now()
+			log.Printf("Main token attempting to claim Nitro gift: %s (spotted by token %d)", event.Code, event.Source+1)
+			var claimWg sync.WaitGroup
+			results := make(chan map[string]interface{}, 1)
+			claimWg.Add(1)
+			go claimNitro(mainToken, event.Code, 1, true, &claimWg, results)
+			go func() {
+				claimWg.Wait()
+				close(results)
+			}()
+			var successful []string
+			var failMsg string
+			for res := range results {
+				if res["success"].(bool) {
+					successful = append(successful, "Main Token")
+					log.Printf("Main token successfully claimed Nitro!")
+				} else {
+					log.Printf("Main token failed to claim: %s", res["message"].(string))
+					failMsg = res["message"].(string)
+				}
+			}
+			snipeTime := time.Since(startTime)
+			if len(successful) > 0 {
+				msg := fmt.Sprintf("🎉 Successfully claimed Nitro gift!\nCode: `%s`\nClaimed with: %s\n⏱️ Snipe time: %s",
+					event.Code,
+					strings.Join(successful, ", "),
+					snipeTime.Round(time.Millisecond))
+				sendWebhook(webhook, msg)
+			} else {
+				msg := fmt.Sprintf("❌ Failed to claim Nitro gift\nCode: `%s`\nReason: %s\n⏱️ Attempt time: %s",
+					event.Code,
+					failMsg,
+					snipeTime.Round(time.Millisecond))
+				sendWebhook(webhook, msg)
+			}
+		}
+	}()
 
 	// Wait for all connections to be established
 	wg.Wait()
