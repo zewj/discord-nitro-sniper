@@ -66,9 +66,10 @@ func loadMainToken() string {
 }
 
 func loadAdditionalTokensAndWebhook() ([]string, string) {
+	log.Println("[CONFIG] Loading tokens.txt file...")
 	file, err := os.Open("tokens.txt")
 	if err != nil {
-		log.Fatalf("Failed to open tokens.txt: %v", err)
+		log.Fatalf("[ERROR] Failed to open tokens.txt: %v", err)
 	}
 	defer file.Close()
 
@@ -78,7 +79,7 @@ func loadAdditionalTokensAndWebhook() ([]string, string) {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil && err != io.EOF {
-			log.Fatalf("Error reading tokens.txt: %v", err)
+			log.Fatalf("[ERROR] Error reading tokens.txt: %v", err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -89,30 +90,50 @@ func loadAdditionalTokensAndWebhook() ([]string, string) {
 		}
 		if strings.HasPrefix(line, "WEBHOOK_URL=") {
 			webhook = strings.TrimPrefix(line, "WEBHOOK_URL=")
+			log.Printf("[CONFIG] Found webhook URL: %s", webhook)
 		} else {
 			tokens = append(tokens, line)
+			log.Printf("[CONFIG] Loaded token %d", len(tokens))
 		}
 		if err == io.EOF {
 			break
 		}
 	}
+	if webhook == "" {
+		log.Println("[WARNING] No webhook URL found in tokens.txt")
+	}
+	log.Printf("[CONFIG] Loaded %d tokens and webhook URL: %s", len(tokens), webhook)
 	return tokens, webhook
 }
 
 func sendWebhook(webhookURL, content string) {
 	if webhookURL == "" {
+		log.Println("[WEBHOOK] No webhook URL provided, skipping webhook send")
 		return
 	}
+	log.Printf("[WEBHOOK] Attempting to send webhook: %s", content)
 	payload := map[string]interface{}{
 		"content":    content,
 		"username":   "Nitro Sniper",
 		"avatar_url": "https://i.imgur.com/4M34hi2.png",
 	}
-	b, _ := json.Marshal(payload)
-	_, err := http.Post(webhookURL, "application/json", strings.NewReader(string(b)))
+	b, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Failed to send webhook: %v", err)
+		log.Printf("[WEBHOOK] Failed to marshal webhook payload: %v", err)
+		return
 	}
+	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(b)))
+	if err != nil {
+		log.Printf("[WEBHOOK] Failed to send webhook: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[WEBHOOK] Webhook send failed with status %d: %s", resp.StatusCode, string(body))
+		return
+	}
+	log.Println("[WEBHOOK] Successfully sent webhook")
 }
 
 func extractNitroCode(content string) string {
@@ -230,7 +251,7 @@ func connectWebSocket(token string, index int, statuses []TokenStatus) *websocke
 			Op: 2,
 			D: IdentifyData{
 				Token:   token,
-				Intents: 513,
+				Intents: 32767, // All intents including DMs
 				Properties: map[string]interface{}{
 					"os":      "windows",
 					"browser": "chrome",
@@ -260,6 +281,7 @@ func connectWebSocket(token string, index int, statuses []TokenStatus) *websocke
 
 func handleWebSocketConnection(conn *websocket.Conn, token string, index int, statuses []TokenStatus, webhook string, codeChan chan<- NitroCodeEvent) {
 	defer conn.Close()
+	log.Printf("[CONNECTION] Token %d WebSocket connection started", index+1)
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -270,7 +292,7 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 
 			// Check if we should attempt reconnection
 			if statuses[index].ReconnectAttempts <= 5 {
-				log.Printf("Token %d WebSocket error: %v. Attempting reconnection...", index+1, err)
+				log.Printf("[RECONNECT] Token %d WebSocket error: %v. Attempting reconnection...", index+1, err)
 				newConn := connectWebSocket(token, index, statuses)
 				if newConn != nil {
 					conn = newConn
@@ -278,7 +300,7 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 				}
 			}
 
-			log.Printf("Token %d WebSocket error: %v. Max reconnection attempts reached.", index+1, err)
+			log.Printf("[ERROR] Token %d WebSocket error: %v. Max reconnection attempts reached.", index+1, err)
 			sendConnectionWebhook(webhook, statuses)
 			return
 		}
@@ -299,7 +321,7 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 				for range ticker.C {
 					hb := Heartbeat{Op: 1, D: nil}
 					if err := conn.WriteJSON(hb); err != nil {
-						log.Printf("Token %d heartbeat error: %v", index+1, err)
+						log.Printf("[HEARTBEAT] Token %d heartbeat error: %v", index+1, err)
 						return
 					}
 				}
@@ -311,28 +333,33 @@ func handleWebSocketConnection(conn *websocket.Conn, token string, index int, st
 			json.Unmarshal(event.D, &msgCreate)
 			code := extractNitroCode(msgCreate.Content)
 			if code != "" {
-				log.Printf("Token %d spotted Nitro gift: %s", index+1, code)
+				log.Printf("[SPOT] Token %d spotted Nitro gift: %s", index+1, code)
+				// Notify via webhook that a code was spotted
+				sendWebhook(webhook, fmt.Sprintf("👀 Token %d spotted Nitro gift: `%s`", index+1, code))
+				log.Printf("[CHANNEL] Token %d sending code to channel: %s", index+1, code)
 				codeChan <- NitroCodeEvent{
 					Code:   code,
 					Source: index,
 				}
+				log.Printf("[CHANNEL] Token %d successfully sent code to channel", index+1)
 			}
 		}
 	}
 }
 
 func main() {
+	log.Println("[STARTUP] Starting Discord Nitro Sniper...")
 	mainToken := loadMainToken()
 	if mainToken == "" {
-		log.Fatal("MAIN_TOKEN is not set in .env file")
+		log.Fatal("[ERROR] MAIN_TOKEN is not set in .env file")
 	}
 	additionalTokens, webhook := loadAdditionalTokensAndWebhook()
 	allTokens := append([]string{mainToken}, additionalTokens...)
-	log.Printf("Loaded %d tokens (1 main + %d additional)", len(allTokens), len(additionalTokens))
+	log.Printf("[CONFIG] Loaded %d tokens (1 main + %d additional)", len(allTokens), len(additionalTokens))
 	if webhook != "" {
-		log.Println("Webhook notifications enabled")
+		log.Println("[CONFIG] Webhook notifications enabled")
 	} else {
-		log.Println("Webhook notifications disabled (no webhook URL found)")
+		log.Println("[CONFIG] Webhook notifications disabled (no webhook URL found)")
 	}
 
 	// Initialize connection statuses
@@ -348,27 +375,15 @@ func main() {
 
 	// Channel for Nitro codes
 	codeChan := make(chan NitroCodeEvent, 10)
+	log.Println("[CHANNEL] Created code channel")
 
-	// Create a WaitGroup to wait for all connections
-	var wg sync.WaitGroup
-
-	// Connect all tokens
-	for i, token := range allTokens {
-		wg.Add(1)
-		go func(index int, token string) {
-			defer wg.Done()
-			conn := connectWebSocket(token, index, statuses)
-			if conn != nil {
-				handleWebSocketConnection(conn, token, index, statuses, webhook, codeChan)
-			}
-		}(i, token)
-	}
-
-	// Main token sniping goroutine
+	// Main token sniping goroutine (start this BEFORE wg.Wait())
 	go func() {
+		log.Println("[MAIN] Main token sniping goroutine started and waiting for codes...")
 		for event := range codeChan {
+			log.Printf("[MAIN] Received code from channel: %s (spotted by token %d)", event.Code, event.Source+1)
 			startTime := time.Now()
-			log.Printf("Main token attempting to claim Nitro gift: %s (spotted by token %d)", event.Code, event.Source+1)
+			log.Printf("[CLAIM] Main token attempting to claim Nitro gift: %s (spotted by token %d)", event.Code, event.Source+1)
 			var claimWg sync.WaitGroup
 			results := make(chan map[string]interface{}, 1)
 			claimWg.Add(1)
@@ -382,9 +397,9 @@ func main() {
 			for res := range results {
 				if res["success"].(bool) {
 					successful = append(successful, "Main Token")
-					log.Printf("Main token successfully claimed Nitro!")
+					log.Printf("[SUCCESS] Main token successfully claimed Nitro!")
 				} else {
-					log.Printf("Main token failed to claim: %s", res["message"].(string))
+					log.Printf("[FAIL] Main token failed to claim: %s", res["message"].(string))
 					failMsg = res["message"].(string)
 				}
 			}
@@ -405,12 +420,31 @@ func main() {
 		}
 	}()
 
+	// Create a WaitGroup to wait for all connections
+	var wg sync.WaitGroup
+
+	// Connect all tokens
+	for i, token := range allTokens {
+		wg.Add(1)
+		go func(index int, token string) {
+			defer wg.Done()
+			log.Printf("[CONNECT] Attempting to connect token %d", index+1)
+			conn := connectWebSocket(token, index, statuses)
+			if conn != nil {
+				log.Printf("[CONNECT] Token %d connected successfully, starting message handler", index+1)
+				handleWebSocketConnection(conn, token, index, statuses, webhook, codeChan)
+			}
+		}(i, token)
+	}
+
 	// Wait for all connections to be established
+	log.Println("[WAIT] Waiting for all token connections to be established...")
 	wg.Wait()
+	log.Println("[READY] All tokens connected, sniper is ready!")
 
 	// Send startup notification
 	if webhook != "" {
-		startupMsg := fmt.Sprintf("🚀 Nitro Sniper Started\n\n"+
+		startupMsg := fmt.Sprintf("�� Bot Started\n\n"+
 			"✅ Successfully connected to Discord\n"+
 			"📊 Loaded %d tokens (1 main + %d additional)\n"+
 			"⏰ Started at: %s",
