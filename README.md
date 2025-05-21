@@ -13,7 +13,7 @@ A high-performance Discord Nitro gift sniper written in Go. This tool monitors D
 
 ## Setup
 
-1. Install Go (1.16 or higher)
+1. Install Go (1.21 or higher)
 2. Install required dependencies:
    ```bash
    go mod init discord-nitro-sniper
