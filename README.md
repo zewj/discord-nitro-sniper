@@ -83,7 +83,38 @@ To run the Discord Nitro Sniper on a VPS, follow these steps:
      go run main.go
      ```
 
-6. **Keep the Sniper Running**:
+6. **(Recommended) Install screen or tmux**:
+   - To keep the sniper running after you disconnect from SSH, you should install `screen` or `tmux`.
+
+   **How to Install and Verify `screen` and `tmux`:**
+
+   1. Update your package list:
+      ```bash
+      sudo apt update
+      ```
+   2. Install both screen and tmux:
+      ```bash
+      sudo apt install screen tmux
+      ```
+   3. Verify installation:
+      ```bash
+      screen --version
+      tmux -V
+      ```
+      If you see version numbers, the installation was successful.
+   4. Basic usage:
+      - To start a new screen session:
+        `screen -S nitro-sniper`
+      - To start a new tmux session:
+        `tmux new -s nitro-sniper`
+      - To detach:
+        - In screen: `Ctrl+A` then `D`
+        - In tmux: `Ctrl+B` then `D`
+      - To reattach:
+        - In screen: `screen -r nitro-sniper`
+        - In tmux: `tmux attach -t nitro-sniper`
+
+7. **Keep the Sniper Running**:
    - Use a process manager like `screen` or `tmux` to keep the sniper running in the background:
      ```bash
      screen -S nitro-sniper
