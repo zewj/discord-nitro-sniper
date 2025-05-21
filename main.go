@@ -45,9 +45,10 @@ type Heartbeat struct {
 }
 
 type TokenStatus struct {
-	Token     string
-	Connected bool
-	Error     string
+	Token             string
+	Connected         bool
+	Error             string
+	ReconnectAttempts int
 }
 
 var lastConnectionWebhook time.Time
@@ -204,6 +205,148 @@ func sendConnectionWebhook(webhookURL string, statuses []TokenStatus) {
 	lastConnectionWebhook = time.Now()
 }
 
+func connectWebSocket(token string, index int, statuses []TokenStatus, webhook string) *websocket.Conn {
+	maxRetries := 5
+	baseDelay := time.Second
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		c, _, err := websocket.DefaultDialer.Dial("wss://gateway.discord.gg/?v=9&encoding=json", nil)
+		if err != nil {
+			delay := baseDelay * time.Duration(1<<uint(attempt))
+			log.Printf("Token %d connection attempt %d failed: %v. Retrying in %v", index+1, attempt+1, err, delay)
+			time.Sleep(delay)
+			continue
+		}
+
+		// Identify payload
+		identify := GatewayPayload{
+			Op: 2,
+			D: IdentifyData{
+				Token:   token,
+				Intents: 513,
+				Properties: map[string]interface{}{
+					"os":      "windows",
+					"browser": "chrome",
+					"device":  "chrome",
+				},
+			},
+		}
+		if err := c.WriteJSON(identify); err != nil {
+			c.Close()
+			delay := baseDelay * time.Duration(1<<uint(attempt))
+			log.Printf("Token %d identify failed: %v. Retrying in %v", index+1, err, delay)
+			time.Sleep(delay)
+			continue
+		}
+
+		statuses[index].Connected = true
+		statuses[index].Error = ""
+		statuses[index].ReconnectAttempts = 0
+		log.Printf("Token %d connected successfully", index+1)
+		return c
+	}
+
+	statuses[index].Connected = false
+	statuses[index].Error = "Failed to connect after maximum retries"
+	return nil
+}
+
+func handleWebSocketConnection(conn *websocket.Conn, token string, index int, statuses []TokenStatus, webhook string) {
+	defer conn.Close()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			statuses[index].Connected = false
+			statuses[index].Error = err.Error()
+			statuses[index].ReconnectAttempts++
+
+			// Check if we should attempt reconnection
+			if statuses[index].ReconnectAttempts <= 5 {
+				log.Printf("Token %d WebSocket error: %v. Attempting reconnection...", index+1, err)
+				newConn := connectWebSocket(token, index, statuses, webhook)
+				if newConn != nil {
+					conn = newConn
+					continue
+				}
+			}
+
+			log.Printf("Token %d WebSocket error: %v. Max reconnection attempts reached.", index+1, err)
+			sendConnectionWebhook(webhook, statuses)
+			return
+		}
+
+		var event DiscordEvent
+		if err := json.Unmarshal(msg, &event); err != nil {
+			continue
+		}
+
+		if event.Op == 10 {
+			var d struct {
+				HeartbeatInterval float64 `json:"heartbeat_interval"`
+			}
+			json.Unmarshal(event.D, &d)
+			heartbeatInterval := time.Duration(d.HeartbeatInterval) * time.Millisecond
+			ticker := time.NewTicker(heartbeatInterval)
+			go func() {
+				for range ticker.C {
+					hb := Heartbeat{Op: 1, D: nil}
+					if err := conn.WriteJSON(hb); err != nil {
+						log.Printf("Token %d heartbeat error: %v", index+1, err)
+						return
+					}
+				}
+			}()
+		}
+
+		if event.T == "MESSAGE_CREATE" {
+			var msgCreate MessageCreate
+			json.Unmarshal(event.D, &msgCreate)
+			code := extractNitroCode(msgCreate.Content)
+			if code != "" {
+				startTime := time.Now()
+				log.Printf("Found Nitro gift: %s", code)
+				var claimWg sync.WaitGroup
+				results := make(chan map[string]interface{}, 1)
+
+				claimWg.Add(1)
+				go claimNitro(token, code, index+1, index == 0, &claimWg, results)
+
+				go func() {
+					claimWg.Wait()
+					close(results)
+				}()
+
+				var successful []string
+				var failMsg string
+				for res := range results {
+					if res["success"].(bool) {
+						successful = append(successful, fmt.Sprintf("Token %d", index+1))
+						log.Printf("Token %d successfully claimed Nitro!", index+1)
+					} else {
+						log.Printf("Token %d failed to claim: %s", index+1, res["message"].(string))
+						failMsg = res["message"].(string)
+					}
+				}
+				snipeTime := time.Since(startTime)
+				if len(successful) > 0 {
+					msg := fmt.Sprintf("🎉 Successfully claimed Nitro gift!\nCode: `%s`\nClaimed with: %s\n⏱️ Snipe time: %s",
+						code,
+						strings.Join(successful, ", "),
+						snipeTime.Round(time.Millisecond))
+					sendWebhook(webhook, msg)
+				} else {
+					msg := fmt.Sprintf("❌ Failed to claim Nitro gift\nCode: `%s`\nReason: %s\n⏱️ Attempt time: %s",
+						code,
+						failMsg,
+						snipeTime.Round(time.Millisecond))
+					sendWebhook(webhook, msg)
+				}
+			}
+		}
+	}
+}
+
 func main() {
 	mainToken := loadMainToken()
 	if mainToken == "" {
@@ -222,122 +365,25 @@ func main() {
 	statuses := make([]TokenStatus, len(allTokens))
 	for i, token := range allTokens {
 		statuses[i] = TokenStatus{
-			Token:     token,
-			Connected: false,
-			Error:     "",
+			Token:             token,
+			Connected:         false,
+			Error:             "",
+			ReconnectAttempts: 0,
 		}
 	}
 
 	// Create a WaitGroup to wait for all connections
 	var wg sync.WaitGroup
-	connections := make([]*websocket.Conn, len(allTokens))
 
 	// Connect all tokens
 	for i, token := range allTokens {
 		wg.Add(1)
 		go func(index int, token string) {
 			defer wg.Done()
-			c, _, err := websocket.DefaultDialer.Dial("wss://gateway.discord.gg/?v=9&encoding=json", nil)
-			if err != nil {
-				statuses[index].Error = err.Error()
-				log.Printf("Token %d failed to connect: %v", index+1, err)
-				return
+			conn := connectWebSocket(token, index, statuses, webhook)
+			if conn != nil {
+				handleWebSocketConnection(conn, token, index, statuses, webhook)
 			}
-			connections[index] = c
-			statuses[index].Connected = true
-			log.Printf("Token %d connected successfully", index+1)
-
-			// Identify payload
-			identify := GatewayPayload{
-				Op: 2,
-				D: IdentifyData{
-					Token:   token,
-					Intents: 513,
-					Properties: map[string]interface{}{
-						"os":      "windows",
-						"browser": "chrome",
-						"device":  "chrome",
-					},
-				},
-			}
-			c.WriteJSON(identify)
-
-			// Start heartbeat for this connection
-			go func(conn *websocket.Conn) {
-				for {
-					_, msg, err := conn.ReadMessage()
-					if err != nil {
-						log.Printf("Token %d WebSocket error: %v", index+1, err)
-						statuses[index].Connected = false
-						statuses[index].Error = err.Error()
-						sendConnectionWebhook(webhook, statuses)
-						return
-					}
-					var event DiscordEvent
-					if err := json.Unmarshal(msg, &event); err != nil {
-						continue
-					}
-					if event.Op == 10 {
-						var d struct {
-							HeartbeatInterval float64 `json:"heartbeat_interval"`
-						}
-						json.Unmarshal(event.D, &d)
-						heartbeatInterval := time.Duration(d.HeartbeatInterval) * time.Millisecond
-						ticker := time.NewTicker(heartbeatInterval)
-						go func() {
-							for range ticker.C {
-								hb := Heartbeat{Op: 1, D: nil}
-								conn.WriteJSON(hb)
-							}
-						}()
-					}
-					if event.T == "MESSAGE_CREATE" {
-						var msgCreate MessageCreate
-						json.Unmarshal(event.D, &msgCreate)
-						code := extractNitroCode(msgCreate.Content)
-						if code != "" {
-							startTime := time.Now()
-							log.Printf("Found Nitro gift: %s", code)
-							var claimWg sync.WaitGroup
-							results := make(chan map[string]interface{}, 1) // Only need space for one result
-
-							// Only use main token to claim
-							claimWg.Add(1)
-							go claimNitro(mainToken, code, 1, true, &claimWg, results)
-
-							go func() {
-								claimWg.Wait()
-								close(results)
-							}()
-
-							var successful []string
-							var failMsg string
-							for res := range results {
-								if res["success"].(bool) {
-									successful = append(successful, "Main Token")
-									log.Printf("Main Token successfully claimed Nitro!")
-								} else {
-									log.Printf("Main Token failed to claim: %s", res["message"].(string))
-									failMsg = res["message"].(string)
-								}
-							}
-							snipeTime := time.Since(startTime)
-							if len(successful) > 0 {
-								msg := fmt.Sprintf("🎉 Successfully claimed Nitro gift!\nCode: `%s`\nClaimed with: Main Token\n⏱️ Snipe time: %s",
-									code,
-									snipeTime.Round(time.Millisecond))
-								sendWebhook(webhook, msg)
-							} else {
-								msg := fmt.Sprintf("❌ Failed to claim Nitro gift\nCode: `%s`\nReason: %s\n⏱️ Attempt time: %s",
-									code,
-									failMsg,
-									snipeTime.Round(time.Millisecond))
-								sendWebhook(webhook, msg)
-							}
-						}
-					}
-				}
-			}(c)
 		}(i, token)
 	}
 
